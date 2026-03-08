@@ -17,46 +17,29 @@
 package main
 
 import (
-	"bytes"
-	"encoding/base64"
-	"encoding/hex"
+	"bufio"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"log"
-	"mime/multipart"
-	"net/http"
-	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/x509"
-	"encoding/pem"
-
 	"github.com/fatih/color"
-	"github.com/naoina/toml"
 	"github.com/urfave/cli/v2"
 )
 
 var (
-	// FIXME: get version from git, as it done in rlgl-server.lisp
 	VERSION = "undefined"
 	red     = color.New(color.FgRed).SprintFunc()
+	green   = color.New(color.FgGreen).SprintFunc()
 	cyan    = color.New(color.FgCyan).SprintFunc()
 )
-
-type Config struct {
-	Host      string
-	Key       string
-	Proxy     string
-	ProxyAuth string
-}
 
 func output(s string) {
 	fmt.Printf("%s %s\n", cyan("rlgl"), s)
@@ -67,670 +50,483 @@ func exitErr(err error) {
 	os.Exit(2)
 }
 
-func make_keys(path string) {
+// --- Test result representation ---
 
-	privateKey, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
-	publicKey := &privateKey.PublicKey
-
-	x509bytes, _ := x509.MarshalECPrivateKey(privateKey)
-	var pemPrivateBlock = &pem.Block{
-		Type:  "EC PRIVATE KEY",
-		Bytes: x509bytes,
-	}
-
-	x509bytesPub, _ := x509.MarshalPKIXPublicKey(publicKey)
-	var pemPublicBlock = &pem.Block{
-		Type:  "PUBLIC KEY",
-		Bytes: x509bytesPub,
-	}
-
-	cfgdir := basedir(path)
-	pemPrivateFile, err := os.Create(cfgdir + "/private_key.pem")
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-
-	err = pem.Encode(pemPrivateFile, pemPrivateBlock)
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-	pemPrivateFile.Close()
-	err = os.Chmod(cfgdir+"/private_key.pem", 0600)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	pemPublicFile, err := os.Create(cfgdir + "/public_key.pem")
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-
-	err = pem.Encode(pemPublicFile, pemPublicBlock)
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-	pemPublicFile.Close()
-	err = os.Chmod(cfgdir+"/public_key.pem", 0644)
-	if err != nil {
-		log.Fatal(err)
-	}
+type TestResult struct {
+	Fields map[string]string
 }
 
-func (c *Config) Write(path string) {
-	cfgdir := basedir(path)
+// --- Report parsers ---
 
-	// create config dir if not exist
-	if _, err := os.Stat(cfgdir); err != nil {
-		err = os.MkdirAll(cfgdir, 0755)
-		if err != nil {
-			exitErr(fmt.Errorf("failed to initialize config dir [%s]: %s", cfgdir, err))
+// detectFormat checks whether the file is JUnit XML or DejaGnu text.
+func detectFormat(filename string) string {
+	f, err := os.Open(filename)
+	if err != nil {
+		return "unknown"
+	}
+	defer f.Close()
+
+	buf := make([]byte, 512)
+	n, _ := f.Read(buf)
+	content := strings.TrimSpace(string(buf[:n]))
+	if strings.HasPrefix(content, "<?xml") || strings.HasPrefix(content, "<test") {
+		return "junit"
+	}
+	return "dejagnu"
+}
+
+// parseDejaGnu parses a DejaGnu summary log into test results.
+func parseDejaGnu(filename string) ([]TestResult, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var results []TestResult
+	host := "UNKNOWN"
+	target := "UNKNOWN"
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		switch {
+		case strings.HasPrefix(line, "Native configuration is "):
+			h := strings.TrimPrefix(line, "Native configuration is ")
+			host = strings.TrimSpace(h)
+			target = host
+		case strings.HasPrefix(line, "Host   is"):
+			host = strings.TrimSpace(strings.TrimPrefix(line, "Host   is"))
+		case strings.HasPrefix(line, "Target is"):
+			target = strings.TrimSpace(strings.TrimPrefix(line, "Target is"))
+		case strings.HasPrefix(line, "FAIL:"):
+			results = append(results, TestResult{Fields: map[string]string{
+				"report": "dejagnu", "result": "FAIL",
+				"host": host, "target": target,
+				"id": strings.TrimSpace(strings.TrimPrefix(line, "FAIL:")),
+			}})
+		case strings.HasPrefix(line, "XFAIL:"):
+			results = append(results, TestResult{Fields: map[string]string{
+				"report": "dejagnu", "result": "XFAIL",
+				"host": host, "target": target,
+				"id": strings.TrimSpace(strings.TrimPrefix(line, "XFAIL:")),
+			}})
+		case strings.HasPrefix(line, "XPASS:"):
+			results = append(results, TestResult{Fields: map[string]string{
+				"report": "dejagnu", "result": "XPASS",
+				"host": host, "target": target,
+				"id": strings.TrimSpace(strings.TrimPrefix(line, "XPASS:")),
+			}})
+		case strings.HasPrefix(line, "PASS:"):
+			results = append(results, TestResult{Fields: map[string]string{
+				"report": "dejagnu", "result": "PASS",
+				"host": host, "target": target,
+				"id": strings.TrimSpace(strings.TrimPrefix(line, "PASS:")),
+			}})
 		}
 	}
+	return results, scanner.Err()
+}
 
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+// JUnit XML structures
+type junitTestSuites struct {
+	XMLName    xml.Name         `xml:"testsuites"`
+	TestSuites []junitTestSuite `xml:"testsuite"`
+}
+
+type junitTestSuite struct {
+	XMLName   xml.Name        `xml:"testsuite"`
+	Name      string          `xml:"name,attr"`
+	TestCases []junitTestCase `xml:"testcase"`
+}
+
+type junitTestCase struct {
+	ClassName string        `xml:"classname,attr"`
+	Name      string        `xml:"name,attr"`
+	Failure   *junitFailure `xml:"failure"`
+	Error     *junitError   `xml:"error"`
+}
+
+type junitFailure struct {
+	Message string `xml:"message,attr"`
+	Type    string `xml:"type,attr"`
+}
+
+type junitError struct {
+	Message string `xml:"message,attr"`
+	Type    string `xml:"type,attr"`
+}
+
+// parseJUnit parses a JUnit XML report into test results.
+func parseJUnit(filename string) ([]TestResult, error) {
+	data, err := os.ReadFile(filename)
 	if err != nil {
-		exitErr(fmt.Errorf("failed to open config for writing: %s", err))
+		return nil, err
 	}
 
-	writer := toml.NewEncoder(file)
-	err = writer.Encode(c)
-	if err != nil {
-		exitErr(fmt.Errorf("failed to write config: %s", err))
-	}
-}
+	var results []TestResult
 
-// determine config path from environment
-func getConfigPath() (path string, exists bool) {
-	userHome, ok := os.LookupEnv("HOME")
-	if !ok {
-		exitErr(fmt.Errorf("$HOME not set"))
-	}
-
-	path = fmt.Sprintf("%s/.rlgl/config", userHome) // default path
-
-	if xdgSupport() {
-		xdgHome, ok := os.LookupEnv("XDG_CONFIG_HOME")
-		if !ok {
-			xdgHome = fmt.Sprintf("%s/.config", userHome)
-		}
-		path = fmt.Sprintf("%s/rlgl/config", xdgHome)
-	}
-
-	if _, err := os.Stat(path); err == nil {
-		exists = true
-	}
-
-	return path, exists
-}
-
-func basedir(path string) string {
-	parts := strings.Split(path, "/")
-	return strings.Join((parts[0 : len(parts)-1]), "/")
-}
-
-// Test for environment supporting XDG spec
-func xdgSupport() bool {
-	re := regexp.MustCompile("^XDG_*")
-	for _, e := range os.Environ() {
-		if re.FindAllString(e, 1) != nil {
-			return true
-		}
-	}
-	return false
-}
-
-func setProxy(proxy string, auth string) {
-
-	var transport *http.Transport
-
-	if proxy != "" {
-		proxyUrl, err := url.Parse(proxy)
-		if err != nil {
-			log.Fatal(err)
-		}
-		if auth != "" {
-			basicAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte(auth))
-			hdr := http.Header{}
-			hdr.Add("Proxy-Authorization", basicAuth)
-			transport = &http.Transport{
-				Proxy:              http.ProxyURL(proxyUrl),
-				ProxyConnectHeader: hdr,
-			}
-		} else {
-			transport = &http.Transport{
-				Proxy: http.ProxyURL(proxyUrl),
+	// Try parsing as <testsuites> wrapper first
+	var suites junitTestSuites
+	if err := xml.Unmarshal(data, &suites); err == nil && len(suites.TestSuites) > 0 {
+		for _, suite := range suites.TestSuites {
+			for _, tc := range suite.TestCases {
+				results = append(results, junitTestCaseToResult(tc))
 			}
 		}
+		return results, nil
+	}
 
-		http.DefaultTransport = transport
+	// Try parsing as a single <testsuite>
+	var suite junitTestSuite
+	if err := xml.Unmarshal(data, &suite); err == nil {
+		for _, tc := range suite.TestCases {
+			results = append(results, junitTestCaseToResult(tc))
+		}
+		return results, nil
+	}
+
+	return nil, fmt.Errorf("failed to parse JUnit XML")
+}
+
+func junitTestCaseToResult(tc junitTestCase) TestResult {
+	result := "PASS"
+	if tc.Failure != nil {
+		result = "FAIL"
+	} else if tc.Error != nil {
+		result = "FAIL"
+	}
+	return TestResult{Fields: map[string]string{
+		"report": "junit",
+		"result": result,
+		"id":     tc.ClassName,
+		"name":   tc.Name,
+	}}
+}
+
+// --- Policy engine ---
+
+type MatchFunc func(value string) bool
+
+type PolicyMatcher struct {
+	Kind           string // "XFAIL", "FAIL", "PASS"
+	Pattern        map[string]MatchFunc
+	ExpirationDate time.Time
+}
+
+type Policy struct {
+	XFAILMatchers []PolicyMatcher
+	FAILMatchers  []PolicyMatcher
+	PASSMatchers  []PolicyMatcher
+}
+
+var rangeMatcher = regexp.MustCompile(`^\d+(\.\d*)?\.\.(\d+(\.\d*)?)$`)
+
+// compileFieldMatcher creates a MatchFunc for a single pattern value.
+// Supports: numeric ranges (N..M), regex (^...), and exact string match.
+func compileFieldMatcher(pattern string) MatchFunc {
+	if rangeMatcher.MatchString(pattern) {
+		parts := strings.SplitN(pattern, "..", 2)
+		low, _ := strconv.ParseFloat(parts[0], 64)
+		high, _ := strconv.ParseFloat(parts[1], 64)
+		return func(value string) bool {
+			v, err := strconv.ParseFloat(value, 64)
+			if err != nil {
+				return false
+			}
+			return v >= low && v <= high
+		}
+	}
+	if strings.HasPrefix(pattern, "^") {
+		re, err := regexp.Compile(pattern + "$")
+		if err != nil {
+			return func(value string) bool { return false }
+		}
+		return func(value string) bool {
+			return re.MatchString(value)
+		}
+	}
+	return func(value string) bool {
+		return value == pattern
 	}
 }
 
-func SendPostRequest(config *Config, url string, filename string, filetype string) []byte {
-	file, err := os.Open(filename)
-
-	if err != nil {
-		log.Fatal(err)
+// extractExpirationDate extracts an optional expiration date after the JSON closing brace.
+func extractExpirationDate(line string) time.Time {
+	lastBrace := strings.LastIndex(line, "}")
+	if lastBrace < 0 || lastBrace >= len(line)-1 {
+		return time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC)
 	}
-	defer file.Close()
-
-	body := &bytes.Buffer{}
-	writer := multipart.NewWriter(body)
-	part, err := writer.CreateFormFile(filetype, file.Name())
-
-	if err != nil {
-		log.Fatal(err)
+	dateStr := strings.TrimSpace(line[lastBrace+1:])
+	if dateStr == "" {
+		return time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC)
 	}
-
-	_, err = io.Copy(part, file)
-	if err != nil {
-		log.Fatal(err)
+	// Try common date formats
+	for _, layout := range []string{
+		"2006-01-02 15:04",
+		"2006-01-02",
+		time.RFC3339,
+	} {
+		if t, err := time.Parse(layout, dateStr); err == nil {
+			return t
+		}
 	}
-
-	writer.Close()
-	request, err := http.NewRequest("POST", url, body)
-
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	var bearer = "Bearer " + config.Key
-	request.Header.Add("Authorization", bearer)
-
-	request.Header.Add("Content-Type", writer.FormDataContentType())
-	client := &http.Client{}
-	response, err := client.Do(request)
-
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer response.Body.Close()
-
-	content, err := ioutil.ReadAll(response.Body)
-
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	return content
+	return time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC)
 }
 
-func loadPrivateKey(cfgdir string) (*ecdsa.PrivateKey, error) {
-
-	priv, err := ioutil.ReadFile(cfgdir + "/private_key.pem")
+// readPolicyFile reads a policy file (XFAIL, FAIL, or PASS) and returns matchers.
+func readPolicyFile(filename string, kind string) ([]PolicyMatcher, error) {
+	f, err := os.Open(filename)
 	if err != nil {
-		log.Fatal(err)
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
 	}
+	defer f.Close()
 
-	block, _ := pem.Decode(priv)
-	if block == nil {
-		log.Fatal("Failed to decode PEM private key")
+	var matchers []PolicyMatcher
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || line[0] == '#' || line[0] == ';' || line[0] == '-' {
+			continue
+		}
+
+		expDate := extractExpirationDate(line)
+
+		// Extract the JSON object (everything up to and including the last })
+		lastBrace := strings.LastIndex(line, "}")
+		if lastBrace < 0 {
+			continue
+		}
+		jsonStr := line[:lastBrace+1]
+
+		var patternMap map[string]string
+		if err := json.Unmarshal([]byte(jsonStr), &patternMap); err != nil {
+			continue
+		}
+
+		compiled := make(map[string]MatchFunc)
+		for k, v := range patternMap {
+			compiled[k] = compileFieldMatcher(v)
+		}
+
+		matchers = append(matchers, PolicyMatcher{
+			Kind:           kind,
+			Pattern:        compiled,
+			ExpirationDate: expDate,
+		})
 	}
+	return matchers, scanner.Err()
+}
 
-	var parsedKey interface{}
-	parsedKey, err = x509.ParseECPrivateKey(block.Bytes)
+// cloneOrUpdatePolicy clones or updates a git policy repo and returns the local path.
+func cloneOrUpdatePolicy(policyURL string) (string, error) {
+	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		log.Fatal(err)
+		return "", err
+	}
+	cacheDir := filepath.Join(homeDir, ".rlgl", "policies")
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		return "", err
 	}
 
-	switch parsedKey := parsedKey.(type) {
-	case *ecdsa.PrivateKey:
-		return parsedKey, nil
+	// Use a hash-like name based on the URL
+	safeName := strings.NewReplacer(
+		"/", "_", ":", "_", ".", "_",
+	).Replace(policyURL)
+	policyDir := filepath.Join(cacheDir, safeName)
+
+	if _, err := os.Stat(filepath.Join(policyDir, ".git")); err == nil {
+		// Directory exists, pull
+		cmd := exec.Command("git", "-C", policyDir, "pull", "--ff-only")
+		cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return "", fmt.Errorf("git pull failed: %s\n%s", err, string(out))
+		}
+	} else {
+		// Clone
+		cmd := exec.Command("git", "clone", policyURL, policyDir)
+		cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return "", fmt.Errorf("git clone failed: %s\n%s", err, string(out))
+		}
 	}
-	log.Fatal("Unsupported private key type")
-	return nil, nil
+
+	return policyDir, nil
+}
+
+// loadPolicy reads the XFAIL, FAIL, and PASS files from a policy directory.
+func loadPolicy(policyDir string) (*Policy, error) {
+	xfail, err := readPolicyFile(filepath.Join(policyDir, "XFAIL"), "XFAIL")
+	if err != nil {
+		return nil, fmt.Errorf("reading XFAIL: %w", err)
+	}
+	fail, err := readPolicyFile(filepath.Join(policyDir, "FAIL"), "FAIL")
+	if err != nil {
+		return nil, fmt.Errorf("reading FAIL: %w", err)
+	}
+	pass, err := readPolicyFile(filepath.Join(policyDir, "PASS"), "PASS")
+	if err != nil {
+		return nil, fmt.Errorf("reading PASS: %w", err)
+	}
+	return &Policy{
+		XFAILMatchers: xfail,
+		FAILMatchers:  fail,
+		PASSMatchers:  pass,
+	}, nil
+}
+
+// matchResult checks if a test result matches all fields in a pattern.
+func matchResult(result TestResult, matcher PolicyMatcher) bool {
+	if time.Now().After(matcher.ExpirationDate) {
+		return false
+	}
+	for field, matchFn := range matcher.Pattern {
+		val, ok := result.Fields[field]
+		if !ok || !matchFn(val) {
+			return false
+		}
+	}
+	return true
+}
+
+// applyPolicy evaluates a list of test results against a policy.
+// Returns "GREEN" or "RED".
+func applyPolicy(policy *Policy, results []TestResult) string {
+	colour := "GREEN"
+
+	for _, result := range results {
+		matched := false
+
+		// 1. Check XFAIL exceptions (green)
+		for _, m := range policy.XFAILMatchers {
+			if matchResult(result, m) {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			continue
+		}
+
+		// 2. Check FAIL patterns (red)
+		for _, m := range policy.FAILMatchers {
+			if matchResult(result, m) {
+				colour = "RED"
+				matched = true
+				break
+			}
+		}
+		if matched {
+			continue
+		}
+
+		// 3. Check PASS patterns (green)
+		for _, m := range policy.PASSMatchers {
+			if matchResult(result, m) {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			continue
+		}
+
+		// 4. No match = RED
+		colour = "RED"
+	}
+
+	return colour
+}
+
+// loadPolicyFromArg handles both local paths and git URLs.
+func loadPolicyFromArg(policyArg string) (*Policy, error) {
+	// If it looks like a local directory with policy files, use directly
+	if info, err := os.Stat(policyArg); err == nil && info.IsDir() {
+		return loadPolicy(policyArg)
+	}
+	// Otherwise treat as a git URL
+	policyDir, err := cloneOrUpdatePolicy(policyArg)
+	if err != nil {
+		return nil, err
+	}
+	return loadPolicy(policyDir)
+}
+
+// parseReport auto-detects format and parses the report file.
+func parseReport(filename string) ([]TestResult, error) {
+	format := detectFormat(filename)
+	switch format {
+	case "junit":
+		return parseJUnit(filename)
+	case "dejagnu":
+		return parseDejaGnu(filename)
+	default:
+		return nil, fmt.Errorf("unknown report format for %s", filename)
+	}
 }
 
 func main() {
 	var policy string
-	var key string
-	var proxy string
-	var proxyauth string
-	var signingkey string
-	var title string
-	var config Config
-
-        labels := cli.NewStringSlice()
-
-	cfgPath, cfgExists := getConfigPath()
-	if !cfgExists {
-		config.Write(cfgPath)
-	} else {
-		f, err := os.Open(cfgPath)
-		if err != nil {
-			exitErr(err)
-		}
-		defer f.Close()
-		if err := toml.NewDecoder(f).Decode(&config); err != nil {
-			exitErr(err)
-		}
-	}
 
 	app := cli.NewApp()
 
 	app.Commands = []*cli.Command{
 		{
-			Name:    "login",
-			Aliases: []string{"l"},
-			Usage:   "login to Red Light Green Light server",
-			Flags: []cli.Flag{
-				&cli.StringFlag{
-					Name:        "key",
-					Value:       "",
-					Usage:       "API key",
-					Destination: &key,
-				},
-				&cli.StringFlag{
-					Name:        "proxy",
-					Value:       "",
-					Usage:       "proxy URL (eg. http://HOST:PORT)",
-					Destination: &proxy,
-				},
-				&cli.StringFlag{
-					Name:        "proxy-auth",
-					Value:       "",
-					Usage:       "proxy basic authentication (eg. USERNAME:PASSWORD)",
-					Destination: &proxyauth,
-				},
-				&cli.StringFlag{
-					Name:        "signing-key",
-					Value:       "",
-					Usage:       "optional private signing key",
-					Destination: &signingkey,
-				},
-			},
-
-			Action: func(c *cli.Context) error {
-
-				if c.NArg() == 0 {
-					exitErr(fmt.Errorf("Missing server URL"))
-				}
-
-				if key == "" {
-					var slash string
-					if strings.HasSuffix(c.Args().First(), "/") {
-						slash = ""
-					} else {
-						slash = "/"
-					}
-					exitErr(fmt.Errorf("Missing API key.  Generate a new one at %s%sget-api-key",
-						c.Args().First(),
-						slash))
-				}
-
-				setProxy(proxy, proxyauth)
-
-				response, err := http.Get(fmt.Sprintf("%s/login", c.Args().First()))
-
-				if err != nil {
-					exitErr(err)
-				}
-
-				responseData, err := ioutil.ReadAll(response.Body)
-				if err != nil {
-					log.Fatal(err)
-				}
-				fmt.Println(string(responseData))
-				config.Host = c.Args().First()
-				config.Key = key
-				config.Proxy = proxy
-				config.ProxyAuth = proxyauth
-				config.Write(cfgPath)
-
-				if signingkey == "" {
-					make_keys(cfgPath)
-				} else {
-					data, err := ioutil.ReadFile(signingkey)
-					if err != nil {
-						log.Fatal(err)
-					}
-					err = ioutil.WriteFile(basedir(cfgPath)+"/private_key.pem", data, 0400)
-					if err != nil {
-						log.Fatal(err)
-					}
-				}
-
-				return nil
-			},
-		},
-		{
-			Name:  "log",
-			Usage: "log evaluations",
-			Flags: []cli.Flag{
-				&cli.StringSliceFlag{
-					Name:        "label",
-                                        Value:       labels,
-                                        Aliases:     []string{"l"},
-					Usage:       "set label `KEY=VALUE`",
-				},
-			},
-
-			Action: func(c *cli.Context) error {
-
-				labels := make(map[string]string)
-                                for _, s := range c.StringSlice("label") {
-                                    x := strings.Split(s, "=")
-                                    labels[x[0]] = x[1]
-                                    }
-
-                                if config.Host == "" {
-					exitErr(fmt.Errorf("Login to server first"))
-				}
-
-				if c.NArg() != 0 {
-					exitErr(fmt.Errorf("Too many arguments"))
-				}
-
-				setProxy(config.Proxy, config.ProxyAuth)
-
-                                labelsValue, _ := json.Marshal(labels);
-				response, err := http.Get(fmt.Sprintf("%s/report-log?labels=\"%s\"", config.Host, url.QueryEscape(base64.StdEncoding.EncodeToString([]byte(string(labelsValue))))))
-
-				if err != nil {
-					exitErr(err)
-				}
-
-				responseData, err := ioutil.ReadAll(response.Body)
-				if err != nil {
-					log.Fatal(err)
-				}
-				fmt.Print(string(responseData))
-
-				return nil
-			},
-		},
-		{
-			Name:    "verify",
-			Aliases: []string{"v"},
-			Usage:   "verify document sigstore record",
-
-			Action: func(c *cli.Context) error {
-
-				if config.Host == "" {
-					exitErr(fmt.Errorf("Login to server first"))
-				}
-
-				if c.NArg() == 0 {
-					exitErr(fmt.Errorf("Missing report argument"))
-				} else if c.NArg() > 1 {
-					exitErr(fmt.Errorf("Too may arguments"))
-				}
-
-				setProxy(config.Proxy, config.ProxyAuth)
-
-				if !strings.HasPrefix(c.Args().First(), "RLGL-") {
-					exitErr(fmt.Errorf("expecting a document ID, but got %s", c.Args().First()))
-				}
-
-				request, err := http.NewRequest("GET", fmt.Sprintf("%s/verify?id=%s", config.Host, c.Args().First()), nil)
-				if err != nil {
-					log.Fatal(err)
-				}
-				var bearer = "Bearer " + config.Key
-				request.Header.Add("Authorization", bearer)
-				request.Header.Add("Content-Type", "text")
-				client := &http.Client{}
-				response, err := client.Do(request)
-
-				if err != nil {
-					log.Fatal(err)
-				}
-				defer response.Body.Close()
-
-				responseData, err := ioutil.ReadAll(response.Body)
-				if err != nil {
-					log.Fatal(err)
-				}
-
-				fmt.Print(string(responseData))
-
-				return nil
-			},
-		},
-		{
-			Name:  "new-policy-bound-api-key",
-			Usage: "create a new policy bound API key",
-
-			Action: func(c *cli.Context) error {
-
-				if config.Host == "" {
-					exitErr(fmt.Errorf("Login to server first"))
-				}
-
-				if c.NArg() == 0 {
-					exitErr(fmt.Errorf("Missing policy argument"))
-				} else if c.NArg() > 1 {
-					exitErr(fmt.Errorf("Too may arguments"))
-				}
-
-				setProxy(config.Proxy, config.ProxyAuth)
-
-				values := map[string]string{"policy": c.Args().First()}
-
-				jsonValue, _ := json.Marshal(values)
-
-				request, err := http.NewRequest("POST", fmt.Sprintf("%s/new-policy-bound-api-key", config.Host), bytes.NewBufferString(string(jsonValue)))
-				if err != nil {
-					log.Fatal(err)
-				}
-				var bearer = "Bearer " + config.Key
-				request.Header.Add("Authorization", bearer)
-				request.Header.Add("Content-Type", "text")
-
-				client := &http.Client{}
-				response, err := client.Do(request)
-
-				if err != nil {
-					log.Fatal(err)
-				}
-				defer response.Body.Close()
-
-				responseData, err := ioutil.ReadAll(response.Body)
-				if err != nil {
-					log.Fatal(err)
-				}
-
-				fmt.Print(string(responseData))
-
-				return nil
-			},
-		},
-		{
-			Name:    "baseline",
-			Aliases: []string{"b"},
-			Usage:   "generate baseline XFAIL regression policy",
-
-			Action: func(c *cli.Context) error {
-
-				if config.Host == "" {
-					exitErr(fmt.Errorf("Login to server first"))
-				}
-
-				if c.NArg() == 0 {
-					exitErr(fmt.Errorf("Missing report argument"))
-				} else if c.NArg() > 1 {
-					exitErr(fmt.Errorf("Too may arguments"))
-				}
-
-				setProxy(config.Proxy, config.ProxyAuth)
-
-				if !strings.HasPrefix(c.Args().First(), "RLGL-") {
-					exitErr(fmt.Errorf("expecting a document ID, but got %s", c.Args().First()))
-				}
-
-				request, err := http.NewRequest("GET", fmt.Sprintf("%s/get-baseline-xfail-policy?id=%s", config.Host, c.Args().First()), nil)
-				if err != nil {
-					log.Fatal(err)
-				}
-				var bearer = "Bearer " + config.Key
-				request.Header.Add("Authorization", bearer)
-				request.Header.Add("Content-Type", "text")
-				client := &http.Client{}
-				response, err := client.Do(request)
-
-				if err != nil {
-					log.Fatal(err)
-				}
-				defer response.Body.Close()
-
-				responseData, err := ioutil.ReadAll(response.Body)
-				if err != nil {
-					log.Fatal(err)
-				}
-
-				fmt.Print(string(responseData))
-
-				return nil
-			},
-		},
-		{
 			Name:    "evaluate",
 			Aliases: []string{"e"},
-			Usage:   "evaluate test results",
+			Usage:   "evaluate test results against a policy",
 			Flags: []cli.Flag{
 				&cli.StringFlag{
 					Name:        "policy",
 					Value:       "",
-					Usage:       "evaluation policy",
+					Usage:       "policy git repo URL or local directory path",
 					Destination: &policy,
-				},
-				&cli.StringSliceFlag{
-					Name:        "label",
-                                        Value:       labels,
-                                        Aliases:     []string{"l"},
-					Usage:       "set label `KEY=VALUE`",
-				},
-				&cli.StringFlag{
-					Name:        "title",
-					Value:       "",
-					Usage:       "report title",
-					Destination: &title,
 				},
 			},
 
 			Action: func(c *cli.Context) error {
-
-				labels := make(map[string]string)
-                                for _, s := range c.StringSlice("label") {
-                                    x := strings.Split(s, "=")
-                                    labels[x[0]] = x[1]
-                                    }
-
-				if (config.Host == "") || (config.Key == "") {
-					exitErr(fmt.Errorf("Login to server first"))
-				}
-
 				if policy == "" {
-					exitErr(fmt.Errorf("Missing policy"))
+					exitErr(fmt.Errorf("missing --policy"))
 				}
-
 				if c.NArg() == 0 {
-					exitErr(fmt.Errorf("Missing report"))
+					exitErr(fmt.Errorf("missing report file argument"))
 				}
 
-				setProxy(config.Proxy, config.ProxyAuth)
+				reportFile := c.Args().Get(0)
 
-				var n string
-				var name string
-
-				message := SendPostRequest(&config, fmt.Sprintf("%s/upload", config.Host), c.Args().Get(0), "bin")
-				n = string(message)
-
-				f, err := os.Open(c.Args().Get(0))
+				// Parse the report
+				results, err := parseReport(reportFile)
 				if err != nil {
-					log.Fatal(err)
-				}
-				defer f.Close()
-
-                                labelsValue, _ := json.Marshal(labels);
-				values := map[string]string{"policy": policy, "name": name, "ref": n, "labels": string(labelsValue)}
-				if title != "" {
-					values["title"] = title
+					exitErr(fmt.Errorf("parsing report: %s", err))
 				}
 
-				jsonValue, _ := json.Marshal(values)
+				if len(results) == 0 {
+					output("No test results found in report")
+					os.Exit(2)
+				}
 
-				request, err := http.NewRequest("POST", fmt.Sprintf("%s/evaluate", config.Host), bytes.NewBufferString(string(jsonValue)))
+				// Load the policy
+				pol, err := loadPolicyFromArg(policy)
 				if err != nil {
-					log.Fatal(err)
-				}
-				var bearer = "Bearer " + config.Key
-				request.Header.Add("Authorization", bearer)
-				request.Header.Add("Content-Type", "application/json")
-				client := &http.Client{}
-				response, err := client.Do(request)
-
-				if err != nil {
-					log.Fatal(err)
-				}
-				defer response.Body.Close()
-
-				responseData, err := ioutil.ReadAll(response.Body)
-				if err != nil {
-					log.Fatal(err)
-				}
-				if responseData[0] != '{' {
-					log.Fatal(string(responseData))
-				}
-				var result map[string]interface{}
-				err = json.Unmarshal([]byte(responseData), &result)
-				if err != nil {
-					log.Fatal(err)
+					exitErr(fmt.Errorf("loading policy: %s", err))
 				}
 
-				cfgdir := basedir(cfgPath)
-				var key, _ = loadPrivateKey(cfgdir)
+				// Evaluate
+				colour := applyPolicy(pol, results)
 
-				var data []byte
-				data, err = hex.DecodeString(fmt.Sprintf("%s", result["digest"]))
-				if err != nil {
-					log.Fatal(err)
-				}
+				output(fmt.Sprintf("Evaluated %d test results", len(results)))
 
-				var r []byte
-				r, err = key.Sign(rand.Reader, data, nil)
-				if err != nil {
-					log.Fatal(err)
-				}
-
-				values = map[string]string{"signature": base64.StdEncoding.EncodeToString(r),
-					"id": fmt.Sprintf("%s", result["callback"])}
-				jsonValue, _ = json.Marshal(values)
-
-				request, err = http.NewRequest("POST", fmt.Sprintf("%s/callback", config.Host), bytes.NewBufferString(string(jsonValue)))
-				if err != nil {
-					log.Fatal(err)
-				}
-				bearer = "Bearer " + config.Key
-				request.Header.Add("Authorization", bearer)
-				request.Header.Add("Content-Type", "text")
-				client = &http.Client{}
-				response, err = client.Do(request)
-
-				if err != nil {
-					log.Fatal(err)
-				}
-				defer response.Body.Close()
-
-				_, err = ioutil.ReadAll(response.Body)
-				if err != nil {
-					log.Fatal(err)
-				}
-
-				fmt.Printf("%s: %s (sha3/256: %s)\n", result["colour"], result["url"], result["digest"])
-
-				if result["colour"] == "GREEN" {
+				if colour == "GREEN" {
+					output(green("GREEN"))
 					os.Exit(0)
 				} else {
-					if result["colour"] == "RED" {
-						os.Exit(1)
-					} else {
-						os.Exit(2)
-					}
+					output(red("RED"))
+					os.Exit(1)
 				}
 				return nil
 			},
@@ -742,20 +538,14 @@ func main() {
 	app.Copyright = "(c) 2018-2022 Anthony Green"
 	app.Compiled = time.Now()
 	app.Authors = []*cli.Author{
-		&cli.Author{
+		{
 			Name:  "Anthony Green",
 			Email: "green@moxielogic.com",
 		},
 	}
-	app.Usage = "Red Light Green Light"
+	app.Usage = "Red Light Green Light - Local Evaluation"
 	app.Action = func(c *cli.Context) error {
-
-		err := cli.ShowAppHelp(c)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		return nil
+		return cli.ShowAppHelp(c)
 	}
 
 	err := app.Run(os.Args)
