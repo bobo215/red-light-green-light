@@ -18,9 +18,11 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha1"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -59,6 +61,7 @@ type TestResult struct {
 // --- Report parsers ---
 
 // detectFormat checks whether the file is JUnit XML or DejaGnu text.
+// Returns "unknown" if the format cannot be determined.
 func detectFormat(filename string) string {
 	f, err := os.Open(filename)
 	if err != nil {
@@ -72,10 +75,43 @@ func detectFormat(filename string) string {
 	if strings.HasPrefix(content, "<?xml") || strings.HasPrefix(content, "<test") {
 		return "junit"
 	}
-	return "dejagnu"
+
+	// Only classify as dejagnu if we see characteristic DejaGnu markers
+	scanner := bufio.NewScanner(strings.NewReader(string(buf[:n])))
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "FAIL:") ||
+			strings.HasPrefix(line, "XFAIL:") ||
+			strings.HasPrefix(line, "XPASS:") ||
+			strings.HasPrefix(line, "PASS:") ||
+			strings.HasPrefix(line, "Native configuration is ") ||
+			strings.HasPrefix(line, "Host   is") ||
+			strings.HasPrefix(line, "Target is") {
+			return "dejagnu"
+		}
+	}
+
+	// Re-read the rest of the file to look for DejaGnu markers
+	f.Seek(0, io.SeekStart)
+	fullScanner := bufio.NewScanner(f)
+	for fullScanner.Scan() {
+		line := fullScanner.Text()
+		if strings.HasPrefix(line, "FAIL:") ||
+			strings.HasPrefix(line, "XFAIL:") ||
+			strings.HasPrefix(line, "XPASS:") ||
+			strings.HasPrefix(line, "PASS:") ||
+			strings.HasPrefix(line, "Native configuration is ") ||
+			strings.HasPrefix(line, "Host   is") ||
+			strings.HasPrefix(line, "Target is") {
+			return "dejagnu"
+		}
+	}
+
+	return "unknown"
 }
 
 // parseDejaGnu parses a DejaGnu summary log into test results.
+// Per legacy behavior, only FAIL, XFAIL, and XPASS are emitted (not PASS).
 func parseDejaGnu(filename string) ([]TestResult, error) {
 	f, err := os.Open(filename)
 	if err != nil {
@@ -117,12 +153,6 @@ func parseDejaGnu(filename string) ([]TestResult, error) {
 				"host": host, "target": target,
 				"id": strings.TrimSpace(strings.TrimPrefix(line, "XPASS:")),
 			}})
-		case strings.HasPrefix(line, "PASS:"):
-			results = append(results, TestResult{Fields: map[string]string{
-				"report": "dejagnu", "result": "PASS",
-				"host": host, "target": target,
-				"id": strings.TrimSpace(strings.TrimPrefix(line, "PASS:")),
-			}})
 		}
 	}
 	return results, scanner.Err()
@@ -157,50 +187,49 @@ type junitError struct {
 	Type    string `xml:"type,attr"`
 }
 
-// parseJUnit parses a JUnit XML report into test results.
+// parseJUnit parses a JUnit XML report using streaming XML decoder.
 func parseJUnit(filename string) ([]TestResult, error) {
-	data, err := os.ReadFile(filename)
+	f, err := os.Open(filename)
 	if err != nil {
 		return nil, err
 	}
+	defer f.Close()
 
 	var results []TestResult
+	decoder := xml.NewDecoder(f)
 
-	// Try parsing as <testsuites> wrapper first
-	var suites junitTestSuites
-	if err := xml.Unmarshal(data, &suites); err == nil && len(suites.TestSuites) > 0 {
-		for _, suite := range suites.TestSuites {
-			for _, tc := range suite.TestCases {
-				results = append(results, junitTestCaseToResult(tc))
-			}
+	for {
+		tok, err := decoder.Token()
+		if err == io.EOF {
+			break
 		}
-		return results, nil
-	}
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse JUnit XML: %w", err)
+		}
 
-	// Try parsing as a single <testsuite>
-	var suite junitTestSuite
-	if err := xml.Unmarshal(data, &suite); err == nil {
-		for _, tc := range suite.TestCases {
+		if se, ok := tok.(xml.StartElement); ok && se.Name.Local == "testcase" {
+			var tc junitTestCase
+			if err := decoder.DecodeElement(&tc, &se); err != nil {
+				return nil, fmt.Errorf("failed to decode testcase element: %w", err)
+			}
 			results = append(results, junitTestCaseToResult(tc))
 		}
-		return results, nil
 	}
 
-	return nil, fmt.Errorf("failed to parse JUnit XML")
+	if len(results) == 0 {
+		return nil, fmt.Errorf("failed to parse JUnit XML: no testcase elements found")
+	}
+
+	return results, nil
 }
 
+// junitTestCaseToResult converts a JUnit testcase to a TestResult.
+// Legacy behavior: "result" is the testcase name, "id" is the classname.
 func junitTestCaseToResult(tc junitTestCase) TestResult {
-	result := "PASS"
-	if tc.Failure != nil {
-		result = "FAIL"
-	} else if tc.Error != nil {
-		result = "FAIL"
-	}
 	return TestResult{Fields: map[string]string{
 		"report": "junit",
-		"result": result,
+		"result": tc.Name,
 		"id":     tc.ClassName,
-		"name":   tc.Name,
 	}}
 }
 
@@ -224,7 +253,7 @@ var rangeMatcher = regexp.MustCompile(`^\d+(\.\d*)?\.\.(\d+(\.\d*)?)$`)
 
 // compileFieldMatcher creates a MatchFunc for a single pattern value.
 // Supports: numeric ranges (N..M), regex (^...), and exact string match.
-func compileFieldMatcher(pattern string) MatchFunc {
+func compileFieldMatcher(pattern string) (MatchFunc, error) {
 	if rangeMatcher.MatchString(pattern) {
 		parts := strings.SplitN(pattern, "..", 2)
 		low, _ := strconv.ParseFloat(parts[0], 64)
@@ -235,81 +264,123 @@ func compileFieldMatcher(pattern string) MatchFunc {
 				return false
 			}
 			return v >= low && v <= high
-		}
+		}, nil
 	}
 	if strings.HasPrefix(pattern, "^") {
 		re, err := regexp.Compile(pattern + "$")
 		if err != nil {
-			return func(value string) bool { return false }
+			return nil, fmt.Errorf("invalid regex %q: %w", pattern, err)
 		}
 		return func(value string) bool {
 			return re.MatchString(value)
-		}
+		}, nil
 	}
 	return func(value string) bool {
 		return value == pattern
-	}
+	}, nil
 }
 
 // extractExpirationDate extracts an optional expiration date after the JSON closing brace.
-func extractExpirationDate(line string) time.Time {
+func extractExpirationDate(line string) (time.Time, error) {
+	farFuture := time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC)
 	lastBrace := strings.LastIndex(line, "}")
 	if lastBrace < 0 || lastBrace >= len(line)-1 {
-		return time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC)
+		return farFuture, nil
 	}
 	dateStr := strings.TrimSpace(line[lastBrace+1:])
 	if dateStr == "" {
-		return time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC)
+		return farFuture, nil
 	}
-	// Try common date formats
+
 	for _, layout := range []string{
-		"2006-01-02 15:04",
-		"2006-01-02",
+		// RFC3339 / ISO8601
 		time.RFC3339,
+		time.RFC3339Nano,
+		// ISO8601 variants
+		"2006-01-02T15:04:05Z0700",
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04",
+		"2006-01-02 15",
+		"2006-01-02",
+		"20060102T150405Z",
+		"20060102T150405",
+		"20060102",
+		// RFC1123 / RFC822
+		time.RFC1123,
+		time.RFC1123Z,
+		time.RFC822,
+		time.RFC822Z,
+		// RFC850 / RFC1036
+		time.RFC850,
+		// asctime
+		"Mon Jan _2 15:04:05 2006",
+		"Mon Jan  2 15:04:05 2006",
+		// W3CDTF
+		"2006-01-02T15:04:05-07:00",
+		// Loose formats
+		"2006-01-02 3:04",
+		"Jan 2, 2006",
+		"January 2, 2006",
+		"Jan 2 2006",
+		"2 Jan 2006",
 	} {
 		if t, err := time.Parse(layout, dateStr); err == nil {
-			return t
+			return t, nil
 		}
 	}
-	return time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC)
+	return farFuture, fmt.Errorf("warning: could not parse expiration date %q, treating as non-expiring", dateStr)
 }
 
 // readPolicyFile reads a policy file (XFAIL, FAIL, or PASS) and returns matchers.
+// Returns an error if the file does not exist (matching legacy hard-fail behavior).
 func readPolicyFile(filename string, kind string) ([]PolicyMatcher, error) {
 	f, err := os.Open(filename)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, fmt.Errorf("required policy file missing: %s", filename)
 		}
 		return nil, err
 	}
 	defer f.Close()
 
 	var matchers []PolicyMatcher
+	lineNum := 0
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
+		lineNum++
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || line[0] == '#' || line[0] == ';' || line[0] == '-' {
 			continue
 		}
 
-		expDate := extractExpirationDate(line)
+		expDate, expErr := extractExpirationDate(line)
+		if expErr != nil {
+			output(fmt.Sprintf("WARNING: %s line %d: %s", filepath.Base(filename), lineNum, expErr))
+		}
 
 		// Extract the JSON object (everything up to and including the last })
 		lastBrace := strings.LastIndex(line, "}")
 		if lastBrace < 0 {
+			output(fmt.Sprintf("WARNING: %s line %d: no JSON object found, skipping", filepath.Base(filename), lineNum))
 			continue
 		}
 		jsonStr := line[:lastBrace+1]
 
 		var patternMap map[string]string
 		if err := json.Unmarshal([]byte(jsonStr), &patternMap); err != nil {
+			output(fmt.Sprintf("WARNING: %s line %d: invalid JSON: %s", filepath.Base(filename), lineNum, err))
 			continue
 		}
 
 		compiled := make(map[string]MatchFunc)
 		for k, v := range patternMap {
-			compiled[k] = compileFieldMatcher(v)
+			fn, compileErr := compileFieldMatcher(v)
+			if compileErr != nil {
+				output(fmt.Sprintf("WARNING: %s line %d: %s", filepath.Base(filename), lineNum, compileErr))
+				continue
+			}
+			compiled[k] = fn
 		}
 
 		matchers = append(matchers, PolicyMatcher{
@@ -332,10 +403,10 @@ func cloneOrUpdatePolicy(policyURL string) (string, error) {
 		return "", err
 	}
 
-	// Use a hash-like name based on the URL
-	safeName := strings.NewReplacer(
-		"/", "_", ":", "_", ".", "_",
-	).Replace(policyURL)
+	// Use SHA1 hash of URL for cache directory name (matching legacy behavior)
+	h := sha1.New()
+	h.Write([]byte(policyURL))
+	safeName := fmt.Sprintf("%x", h.Sum(nil))[:8]
 	policyDir := filepath.Join(cacheDir, safeName)
 
 	if _, err := os.Stat(filepath.Join(policyDir, ".git")); err == nil {
@@ -360,6 +431,7 @@ func cloneOrUpdatePolicy(policyURL string) (string, error) {
 }
 
 // loadPolicy reads the XFAIL, FAIL, and PASS files from a policy directory.
+// All three files must exist (matching legacy behavior).
 func loadPolicy(policyDir string) (*Policy, error) {
 	xfail, err := readPolicyFile(filepath.Join(policyDir, "XFAIL"), "XFAIL")
 	if err != nil {
@@ -395,7 +467,7 @@ func matchResult(result TestResult, matcher PolicyMatcher) bool {
 }
 
 // applyPolicy evaluates a list of test results against a policy.
-// Returns "GREEN" or "RED".
+// Returns "GREEN" or "RED". Empty results stay GREEN (matching legacy).
 func applyPolicy(policy *Policy, results []TestResult) string {
 	colour := "GREEN"
 
@@ -466,7 +538,7 @@ func parseReport(filename string) ([]TestResult, error) {
 	case "dejagnu":
 		return parseDejaGnu(filename)
 	default:
-		return nil, fmt.Errorf("unknown report format for %s", filename)
+		return nil, fmt.Errorf("unsupported or unrecognized report format for %s", filename)
 	}
 }
 
@@ -496,6 +568,9 @@ func main() {
 				if c.NArg() == 0 {
 					exitErr(fmt.Errorf("missing report file argument"))
 				}
+				if c.NArg() > 1 {
+					exitErr(fmt.Errorf("too many arguments: expected 1 report file, got %d", c.NArg()))
+				}
 
 				reportFile := c.Args().Get(0)
 
@@ -505,18 +580,13 @@ func main() {
 					exitErr(fmt.Errorf("parsing report: %s", err))
 				}
 
-				if len(results) == 0 {
-					output("No test results found in report")
-					os.Exit(2)
-				}
-
 				// Load the policy
 				pol, err := loadPolicyFromArg(policy)
 				if err != nil {
 					exitErr(fmt.Errorf("loading policy: %s", err))
 				}
 
-				// Evaluate
+				// Evaluate — empty results stay GREEN (matching legacy behavior)
 				colour := applyPolicy(pol, results)
 
 				output(fmt.Sprintf("Evaluated %d test results", len(results)))
